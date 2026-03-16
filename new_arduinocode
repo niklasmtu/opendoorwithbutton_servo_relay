@@ -1,0 +1,295 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Servo.h>
+
+// --- KONFIGURATION AV PINNAR ---
+#define PIN_SERVO       3
+#define PIN_RELA        4   // Styr låset (Relä)
+#define PIN_BUZZER      5
+#define PIN_LED_ROD     6
+#define PIN_LED_GRON    7
+#define PIN_LED_GUL     8   // Brandindikator
+
+#define PIN_RFID_RST    9
+#define PIN_RFID_SS     10
+
+// Analoga pinnar används som digitala ingångar
+#define PIN_BTN_ABK_UTE A0
+#define PIN_BTN_ABK_INNE A1
+#define PIN_BTN_NODUT   A2
+#define PIN_BTN_BRAND   A3
+#define PIN_BTN_TAMPER  A4
+#define PIN_MAGNET      A5  // Simulerar dörrbladets kontakt
+
+// --- OBJEKT ---
+MFRC522 rfid(PIN_RFID_SS, PIN_RFID_RST);
+Servo doorServo;
+
+// --- TIDSVARIABLER (MILLIS) ---
+// Vi använder "unsigned long" för tidmätning för att undvika problem när räknaren slår runt.
+unsigned long lastMillis = 0;       
+unsigned long timerDoor = 0;        // Timer för hur länge dörren är öppen
+unsigned long timerUnlock = 0;      // Timer för hur länge låset är upplåst (väntar på ABK)
+unsigned long timerBlink = 0;       // Timer för LED-blink vid larm
+
+// Inställningar för tider (ms)
+const long TID_UPPLAST = 5000;      // 5 sekunder
+const long TID_OPPEN   = 5000;      // 5 sekunder
+const long TID_MEK_DELAY = 500;     // 0.5 sekunder fördröjning
+const long BLINK_HASTIGHET = 250;   // Hur fort röd LED blinkar vid tamper
+
+// --- SYSTEMSTATUS (STATE MACHINE) ---
+// Vi definierar olika lägen som systemet kan vara i.
+enum SystemState {
+  LAGE_NORMAL,      // Dörr stängd och låst, väntar.
+  LAGE_UPPLAST,     // RFID godkänd, låset öppet, väntar på ABK-tryck.
+  LAGE_OPPNAR,      // Process: Låser upp -> Väntar -> Motorn går.
+  LAGE_OPPEN,       // Dörren står fysiskt öppen.
+  LAGE_STANGER,     // Process: Motorn går igen -> Väntar -> Låser.
+  LAGE_BRAND,       // Brandlarm aktivt.
+  LAGE_SABOTAGE     // Tamper aktivt.
+};
+
+SystemState currentState = LAGE_NORMAL;
+
+// Variabler för logik
+bool brandActive = false;
+bool tamperActive = false;
+bool tamperToggleState = false; // Håller koll på om tamper är "på" eller "av"
+bool doorIsOpen = false;        // Håller koll på servots position
+
+// Hårdkodat ID för godkänd RFID-tagg (ÄNDRA DESSA SIFFROR TILL DIN EGEN TAGG!)
+// Du ser ID i Serial Monitor när du blippar.
+String godkandTagg = "B6 5C C5 43"; 
+
+void setup() {
+  Serial.begin(9600); // Starta kommunikation med datorn för felsökning
+  SPI.begin();        // Starta SPI-buss
+  rfid.PCD_Init();    // Initiera RFID-läsare
+  doorServo.attach(PIN_SERVO);
+
+  // Konfigurera utgångar
+  pinMode(PIN_RELA, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_LED_ROD, OUTPUT);
+  pinMode(PIN_LED_GRON, OUTPUT);
+  pinMode(PIN_LED_GUL, OUTPUT);
+
+  // Konfigurera ingångar med INPUT_PULLUP
+  // Detta gör att vi inte behöver externa motstånd.
+  // OBS: Logic is INVERTED! LOW (0) betyder tryckt knapp.
+  pinMode(PIN_BTN_ABK_UTE, INPUT_PULLUP);
+  pinMode(PIN_BTN_ABK_INNE, INPUT_PULLUP);
+  pinMode(PIN_BTN_NODUT, INPUT_PULLUP);
+  pinMode(PIN_BTN_BRAND, INPUT_PULLUP);
+  pinMode(PIN_BTN_TAMPER, INPUT_PULLUP);
+  pinMode(PIN_MAGNET, INPUT_PULLUP);
+
+  // Grundläge
+  digitalWrite(PIN_RELA, HIGH); // Relämoduler är ofta aktiva på LOW. HIGH = Låst.
+  doorServo.write(0);           // Servo i stängt läge (0 grader)
+  
+  Serial.println("--- SYSTEM STARTAT ---");
+  Serial.println("Vantar pa tagg eller knapp...");
+}
+
+void loop() {
+  unsigned long currentMillis = millis(); // Hämta aktuell tid
+
+  // 1. LÄS AV KNAPPAR (Inverterad logik: !digitalRead betyder "om knapp är tryckt")
+  bool btnAbkUte = !digitalRead(PIN_BTN_ABK_UTE);
+  bool btnAbkInne = !digitalRead(PIN_BTN_ABK_INNE);
+  bool btnNodut = !digitalRead(PIN_BTN_NODUT);
+  bool btnBrand = !digitalRead(PIN_BTN_BRAND);
+  bool btnTamper = !digitalRead(PIN_BTN_TAMPER);
+  bool magnetKontakt = !digitalRead(PIN_MAGNET); // Antag att LOW = Dörr stängd (magnet påverkad)
+
+  // 2. HANTERA BRANDLARM (Högsta prioritet, toggle funktion)
+  if (btnBrand) {
+    delay(200); // Debounce (förhindra dubbeltryck)
+    brandActive = !brandActive; // Växla läge
+    if (brandActive) {
+      Serial.println("!!! BRANDLARM AKTIVERAT !!!");
+      changeState(LAGE_BRAND);
+    } else {
+      Serial.println("Brandlarm aterstallt.");
+      digitalWrite(PIN_LED_GUL, LOW);
+      changeState(LAGE_NORMAL);
+    }
+    // Vänta tills knappen släpps
+    while(!digitalRead(PIN_BTN_BRAND)); 
+  }
+
+  // 3. HANTERA TAMPER (Om inte brandlarm är aktivt)
+  if (btnTamper && !brandActive) {
+     delay(200); 
+     tamperToggleState = !tamperToggleState;
+     if (tamperToggleState) {
+       Serial.println("!!! SABOTAGE UPPTACKT !!!");
+       changeState(LAGE_SABOTAGE);
+     } else {
+       Serial.println("Sabotage aterstallt.");
+       digitalWrite(PIN_LED_ROD, LOW);
+       changeState(LAGE_NORMAL);
+     }
+     while(!digitalRead(PIN_BTN_TAMPER));
+  }
+
+  // 4. HANTERA NÖDUT (Fungerar alltid)
+  if (btnNodut) {
+    Serial.println("NODUT TRYCKT - Oppnar las!");
+    lasiUpp();
+    // Om vi är i brandläge ska vi INTE ändra state, bara låsa upp
+    if (currentState != LAGE_BRAND && currentState != LAGE_SABOTAGE) {
+      // Ev. logik om man vill att den ska gå till öppet läge
+    }
+  } else if (currentState == LAGE_BRAND || currentState == LAGE_SABOTAGE) {
+     // I larm-läge ska låset gå tillbaka till låst när nödut släpps (om man vill ha det så)
+     // Eller så låter man det vara upplåst. Här väljer vi: Nödut intryckt = Låset drar.
+  } else if (currentState == LAGE_NORMAL) {
+     las(); // Se till att det är låst om ingen trycker
+  }
+
+  // 5. TILLSTÅNDSMASKIN (Logiken för normal drift)
+  switch (currentState) {
+    
+    case LAGE_NORMAL:
+      // I normalt läge lyssnar vi på RFID och Inre ABK
+      las(); // Säkerställ låst
+      digitalWrite(PIN_LED_GRON, LOW);
+      
+      // -- RFID LOGIK --
+      if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+        String readID = "";
+        for (byte i = 0; i < rfid.uid.size; i++) {
+          readID += String(rfid.uid.uidByte[i] < 0x10 ? " 0" : " ");
+          readID += String(rfid.uid.uidByte[i], HEX);
+        }
+        readID.trim();
+        readID.toUpperCase();
+
+        Serial.print("Laste tagg: "); Serial.println(readID);
+
+        if (readID == godkandTagg) {
+          Serial.println("TAGG GODKAND -> Lage Upplast");
+          beep(1); // Ett pip
+          changeState(LAGE_UPPLAST);
+        } else {
+          Serial.println("TAGG NEKAD");
+          beep(3); // Fel-pip
+          // Blinka rött snabbt
+          digitalWrite(PIN_LED_ROD, HIGH); delay(200); digitalWrite(PIN_LED_ROD, LOW);
+        }
+        rfid.PICC_HaltA(); // Stoppa läsning
+        rfid.PCD_StopCrypto1();
+      }
+
+      // -- ABK INNE LOGIK --
+      if (btnAbkInne) {
+        Serial.println("ABK INNE -> Oppnar helt");
+        changeState(LAGE_OPPNAR);
+      }
+      break;
+
+    case LAGE_UPPLAST:
+      // RFID Godkänd. Låset är öppet. Väntar på att man trycker handtag/ABK Ute.
+      lasiUpp();
+      digitalWrite(PIN_LED_GRON, HIGH);
+
+      // Om ABK Ute trycks -> Öppna dörren med motor
+      if (btnAbkUte) {
+        Serial.println("ABK UTE tryckt -> Motorn oppnar");
+        changeState(LAGE_OPPEN); // Hoppa direkt till öppen (eller via Öppnar för delay)
+        oppnaMotor();
+      }
+
+      // Timeout - Om ingen öppnar inom 5 sekunder -> Lås igen
+      if (currentMillis - timerUnlock > TID_UPPLAST) {
+        Serial.println("TIMEOUT -> Laser igen");
+        changeState(LAGE_NORMAL);
+      }
+      break;
+
+    case LAGE_OPPNAR:
+      // Sekvens: Lås upp -> Vänta -> Motor
+      lasiUpp();
+      digitalWrite(PIN_LED_GRON, HIGH);
+      // Här skulle man kunna ha non-blocking delay, men för enkelhetens skull i sekvensen:
+      // Vi har redan state delay i övergången om vi vill.
+      // För nu: Kör motor direkt (vi simulerar mekanisk fördröjning via servo-hastighet eller kod om vi vill)
+      delay(TID_MEK_DELAY); // Liten paus så kolven hinner in
+      oppnaMotor();
+      changeState(LAGE_OPPEN);
+      break;
+
+    case LAGE_OPPEN:
+      // Dörren står öppen
+      // Vänta X sekunder
+      if (currentMillis - timerDoor > TID_OPPEN) {
+        Serial.println("Tid ute -> Stanger dorr");
+        changeState(LAGE_STANGER);
+      }
+      break;
+
+    case LAGE_STANGER:
+      stangMotor();
+      // Vänta tills dörren är fysiskt stängd (här simulerat med tid)
+      if (currentMillis - timerDoor > 2000) { // Ge motorn 2 sekunder att gå hem
+         changeState(LAGE_NORMAL);
+      }
+      break;
+
+    case LAGE_BRAND:
+      digitalWrite(PIN_LED_GUL, HIGH);
+      stangMotor(); // Tvinga stängd för rök
+      digitalWrite(PIN_LED_GRON, LOW);
+      // Nödut hanteras av globala if-satsen ovan
+      break;
+
+    case LAGE_SABOTAGE:
+      // Blinka röd LED
+      if (currentMillis - timerBlink > BLINK_HASTIGHET) {
+        timerBlink = currentMillis;
+        digitalWrite(PIN_LED_ROD, !digitalRead(PIN_LED_ROD)); // Toggle LED
+        // Pip om man vill
+        // digitalWrite(PIN_BUZZER, !digitalRead(PIN_BUZZER));
+      }
+      stangMotor();
+      las();
+      break;
+  }
+}
+
+// --- HJÄLPFUNKTIONER ---
+
+void changeState(SystemState newState) {
+  currentState = newState;
+  // Nollställ timers vid byte
+  timerDoor = millis();
+  timerUnlock = millis();
+}
+
+void lasiUpp() {
+  digitalWrite(PIN_RELA, LOW); // LOW brukar aktivera reläet (klick)
+}
+
+void las() {
+  digitalWrite(PIN_RELA, HIGH); // HIGH inaktiverar (låser)
+}
+
+void oppnaMotor() {
+  doorServo.write(90); // 90 grader
+}
+
+void stangMotor() {
+  doorServo.write(0); // 0 grader (stängd)
+}
+
+void beep(int times) {
+  for (int i=0; i<times; i++) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    delay(100);
+    digitalWrite(PIN_BUZZER, LOW);
+    delay(100);
+  }
+}
